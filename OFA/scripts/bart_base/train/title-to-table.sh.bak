@@ -1,0 +1,107 @@
+#!/usr/bin/env
+
+ROOT=${PWD}
+
+# The port for communication. Note that if you want to run multiple tasks on the same machine,
+# you need to specify different port numbers.
+export MASTER_PORT=2051
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+export GPUS_PER_NODE=4
+
+log_dir=${ROOT}/logs/bart_base/title-to-table
+save_dir=${ROOT}/models/bart_base/title-to-table
+mkdir -p $log_dir $save_dir
+
+fs_dir=${ROOT}/OFA/fairseq
+data_dir=${ROOT}/../datasets/text-to-text/ease/title-to-table
+data=${data_dir}/train.tsv,${data_dir}/valid.tsv
+restore_file=${ROOT}/checkpoints/bart.base
+
+OUT_DIR=${ROOT}/fairseq/preprocessed
+if [ ! -d ${OUT_DIR} ]; then
+    mkdir -p ${OUT_DIR}
+fi
+
+cd ${OUT_DIR}
+
+wget -N 'https://dl.fbaipublicfiles.com/fairseq/gpt2_bpe/encoder.json'
+wget -N 'https://dl.fbaipublicfiles.com/fairseq/gpt2_bpe/vocab.bpe'
+wget -N 'https://dl.fbaipublicfiles.com/fairseq/gpt2_bpe/dict.txt'
+
+cd ${fs_dir}
+
+for SPLIT in train valid
+do
+  cat ${data_dir}/${SPLIT}.tsv |awk -F"\t" '{print $1}' > ${OUT_DIR}/${SPLIT}.src
+  cat ${data_dir}/${SPLIT}.tsv |awk -F"\t" '{print $2}' > ${OUT_DIR}/${SPLIT}.tgt
+  for LANG in src tgt
+  do
+    python -m examples.roberta.multiprocessing_bpe_encoder \
+    --encoder-json ${OUT_DIR}/encoder.json \
+    --vocab-bpe ${OUT_DIR}/vocab.bpe \
+    --inputs "${OUT_DIR}/${SPLIT}.${LANG}" \
+    --outputs "${OUT_DIR}/${SPLIT}.bpe.${LANG}" \
+    --workers 60 \
+    --keep-empty;
+  done
+done
+
+max_src_length=80
+max_tgt_length=512
+
+for SPLIT in train valid
+do
+  python ${ROOT}/scripts/utils/truncation.py \
+    --prefix "${OUT_DIR}/${SPLIT}.bpe" \
+    --src "src" \
+    --tgt "tgt" \
+    --max_src_len ${max_src_length} \
+    --max_tgt_len ${max_tgt_length}
+done
+
+fairseq-preprocess \
+  --source-lang "src" \
+  --target-lang "tgt" \
+  --trainpref "${OUT_DIR}/train.bpe.cut" \
+  --validpref "${OUT_DIR}/valid.bpe.cut" \
+  --destdir "${OUT_DIR}/bin" \
+  --workers 60 \
+  --srcdict ${OUT_DIR}/dict.txt \
+  --tgtdict ${OUT_DIR}/dict.txt
+
+cd ${ROOT}
+
+arch=bart_base
+criterion=label_smoothed_cross_entropy
+label_smoothing=0.1
+max_epoch=10
+warmup_updates=6000
+batch_size=8
+update_freq=16
+lr=5e-5
+resnet_drop_path_rate=0.0
+encoder_drop_path_rate=0.1
+decoder_drop_path_rate=0.1
+dropout=0.1
+attention_dropout=0.0
+
+CUDA_VISIBLE_DEVICES=0,1,2,3 fairseq-train ${OUT_DIR}/bin \
+    --restore-file ${restore_file} \
+    --batch-size ${batch_size} \
+    --save-dir ${save_dir} \
+    --task translation \
+    --source-lang src --target-lang tgt \
+    --layernorm-embedding \
+    --share-all-embeddings \
+    --share-decoder-input-output-embed \
+    --reset-optimizer --reset-dataloader --reset-meters \
+    --required-batch-size-multiple 1 \
+    --arch ${arch} \
+    --criterion ${criterion} \
+    --label-smoothing ${label_smoothing} \
+    --dropout ${dropout} --attention-dropout ${attention_dropout} \
+    --weight-decay 0.01 --optimizer adam --adam-betas "(0.9, 0.999)" --adam-eps 1e-08 \
+    --lr-scheduler polynomial_decay --lr ${lr} --max-epoch ${max_epoch} --warmup-updates ${warmup_updates} \
+    --fp16-scale-window=512 \
+    --fp16 --update-freq ${update_freq}
+
