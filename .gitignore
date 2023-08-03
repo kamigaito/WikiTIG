@@ -2,7 +2,10 @@
 ./data
 ./datasets
 
-#
+# Environment
+.python-version
+
+# Model files
 *.pth
 
 # Byte-compiled / optimized / DLL files
